@@ -193,10 +193,6 @@ export default function CameraSidebar({
                   <Video size={12} />
                   {camera.source || "Sumber CCTV"}
                 </span>
-
-                <span>
-                  {camera.views ?? 0} ditonton
-                </span>
               </div>
             </button>
           );

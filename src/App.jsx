@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+
+import { useCallback, useMemo, useState } from "react";
 import {
   Layers,
   LocateFixed,
@@ -17,18 +18,79 @@ export default function App() {
   const [area, setArea] = useState("Semua Wilayah");
   const [statusFilter, setStatusFilter] = useState("Semua");
 
-  const [selectedCamera, setSelectedCamera] = useState(
+  // Status awal belum dianggap Online sebelum diperiksa.
+  const [cameraStatuses, setCameraStatuses] = useState(() =>
+    Object.fromEntries(
+      cameraData.map((camera) => [
+        camera.id,
+        "unverified",
+      ])
+    )
+  );
+
+  // Gunakan status terbaru tanpa mengubah data kamera asli.
+  const cameras = useMemo(
     () =>
-      cameraData.find(
-        (camera) => camera.streamUrl || camera.embedUrl
-      ) ||
-      cameraData[0] ||
-      null
+      cameraData.map((camera) => ({
+        ...camera,
+        status:
+          cameraStatuses[camera.id] ?? "unverified",
+      })),
+    [cameraStatuses]
+  );
+
+  const [selectedCameraId, setSelectedCameraId] = useState(
+    () =>
+      (
+        cameraData.find(
+          (camera) => camera.streamUrl || camera.embedUrl
+        ) ||
+        cameraData[0]
+      )?.id ?? null
   );
 
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showPlayer, setShowPlayer] = useState(true);
   const [mapStyle, setMapStyle] = useState("standard");
+
+  // Ambil objek kamera terbaru berdasarkan ID.
+  const selectedCamera = useMemo(
+    () =>
+      cameras.find(
+        (camera) => camera.id === selectedCameraId
+      ) ?? null,
+    [cameras, selectedCameraId]
+  );
+
+  // Terima hasil pemeriksaan dari CameraPlayer.
+  const handleStatusChange = useCallback(
+    (cameraId, status, message) => {
+      if (!cameraId || !status) return;
+
+      setCameraStatuses((previous) => {
+        if (previous[cameraId] === status) {
+          return previous;
+        }
+
+        return {
+          ...previous,
+          [cameraId]: status,
+        };
+      });
+
+      // Informasi diagnostik tersedia di Console tanpa
+      // mengubah tampilan aplikasi.
+      if (
+        status === "offline" &&
+        message
+      ) {
+        console.warn(
+          `[BogorCam] Kamera ${cameraId}: ${message}`
+        );
+      }
+    },
+    []
+  );
 
   const toggleSidebar = () => {
     setSidebarOpen((previous) => !previous);
@@ -37,7 +99,7 @@ export default function App() {
   const mapCameras = useMemo(() => {
     const query = search.trim().toLowerCase();
 
-    return cameraData.filter((camera) => {
+    return cameras.filter((camera) => {
       const searchableText = [
         camera.name,
         camera.location,
@@ -52,28 +114,34 @@ export default function App() {
         !query || searchableText.includes(query);
 
       const matchesArea =
-        area === "Semua Wilayah" || camera.area === area;
+        area === "Semua Wilayah" ||
+        camera.area === area;
 
       const matchesStatus =
         statusFilter === "Semua" ||
         camera.status === statusFilter.toLowerCase();
 
-      return matchesQuery && matchesArea && matchesStatus;
+      return (
+        matchesQuery &&
+        matchesArea &&
+        matchesStatus
+      );
     });
-  }, [search, area, statusFilter]);
+  }, [cameras, search, area, statusFilter]);
 
-  const selectCamera = (camera) => {
+  const selectCamera = useCallback((camera) => {
     if (!camera) return;
 
-    setSelectedCamera(camera);
+    setSelectedCameraId(camera.id);
     setShowPlayer(true);
-  };
+  }, []);
 
   const selectAvailableCamera = () => {
     const camera =
-      cameraData.find(
-        (item) => item.streamUrl || item.embedUrl
-      ) || cameraData[0];
+      cameras.find(
+        (item) =>
+          item.streamUrl || item.embedUrl
+      ) || cameras[0];
 
     if (camera) {
       selectCamera(camera);
@@ -91,7 +159,7 @@ export default function App() {
       >
         {/* Sidebar CCTV */}
         <CameraSidebar
-          cameras={cameraData}
+          cameras={cameras}
           selectedCamera={selectedCamera}
           onSelect={selectCamera}
           search={search}
@@ -103,7 +171,7 @@ export default function App() {
           sidebarOpen={sidebarOpen}
         />
 
-        {/* Tombol panah: sejajar dengan sidebar dan map-stage */}
+        {/* Tombol buka/tutup sidebar */}
         <button
           type="button"
           className={`sidebar-edge-toggle ${
@@ -111,11 +179,17 @@ export default function App() {
           }`}
           onClick={toggleSidebar}
           aria-label={
-            sidebarOpen ? "Tutup sidebar" : "Buka sidebar"
+            sidebarOpen
+              ? "Tutup sidebar"
+              : "Buka sidebar"
           }
           aria-expanded={sidebarOpen}
           aria-controls="camera-sidebar"
-          title={sidebarOpen ? "Tutup sidebar" : "Buka sidebar"}
+          title={
+            sidebarOpen
+              ? "Tutup sidebar"
+              : "Buka sidebar"
+          }
         >
           {sidebarOpen ? (
             <ChevronLeft size={17} />
@@ -168,7 +242,9 @@ export default function App() {
               type="button"
               onClick={() =>
                 setMapStyle((previous) =>
-                  previous === "standard" ? "hot" : "standard"
+                  previous === "standard"
+                    ? "hot"
+                    : "standard"
                 )
               }
               title="Ganti tampilan peta"
@@ -198,6 +274,7 @@ export default function App() {
               <i className="legend-pin" />
               Kawasan CCTV (perkiraan)
             </span>
+
             <span>
               <i className="legend-ring" />
               Dipilih
@@ -215,10 +292,12 @@ export default function App() {
           {/* Pemutar CCTV */}
           {showPlayer && selectedCamera && (
             <CameraPlayer
+              key={selectedCamera.id}
               camera={selectedCamera}
-              cameras={cameraData}
+              cameras={cameras}
               onClose={() => setShowPlayer(false)}
               onSelectNearby={selectCamera}
+              onStatusChange={handleStatusChange}
             />
           )}
         </section>

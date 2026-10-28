@@ -16,85 +16,207 @@ export default function CameraPlayer({
   onClose,
   onSelectNearby,
   cameras = [],
+  onStatusChange,
 }) {
   const videoRef = useRef(null);
+  const statusCallbackRef = useRef(onStatusChange);
 
   const [playbackError, setPlaybackError] = useState(false);
+  const [playbackStatus, setPlaybackStatus] = useState(
+    camera?.status || "unverified"
+  );
   const [saved, setSaved] = useState(false);
   const [liked, setLiked] = useState(false);
   const [copied, setCopied] = useState(false);
+
+  statusCallbackRef.current = onStatusChange;
 
   const isYouTube = camera?.streamProvider === "youtube";
   const streamUrl = camera?.streamUrl;
   const embedUrl = camera?.embedUrl;
 
   useEffect(() => {
+    setPlaybackStatus(camera?.status || "unverified");
+    setPlaybackError(false);
+  }, [camera?.id, camera?.status]);
+
+  useEffect(() => {
     const video = videoRef.current;
 
-    setPlaybackError(false);
+    let hls = null;
+    let disposed = false;
+    let healthCheckId = null;
+    let lastCurrentTime = 0;
+    let stalledChecks = 0;
 
-    // Jangan menjalankan HLS untuk sumber YouTube.
-    if (!streamUrl || !video || isYouTube) {
-      return undefined;
+    const reportStatus = (status, message) => {
+      if (disposed) return;
+
+      setPlaybackStatus(status);
+
+      statusCallbackRef.current?.(
+        camera?.id,
+        status,
+        message
+      );
+    };
+
+    const markOffline = (message) => {
+      setPlaybackError(true);
+      reportStatus("offline", message);
+    };
+
+    const markOnline = () => {
+      setPlaybackError(false);
+      stalledChecks = 0;
+      lastCurrentTime = video?.currentTime || 0;
+
+      reportStatus("online", "Stream berhasil mengirim video");
+    };
+
+    if (!camera || !streamUrl || !video || isYouTube) {
+      if (camera && !isYouTube) {
+        reportStatus(
+          "unverified",
+          "URL stream belum tersedia"
+        );
+      }
+
+      return () => {
+        disposed = true;
+      };
     }
 
-    let hls;
+    reportStatus("checking", "Sedang memeriksa stream");
 
-    const handleNativeError = () => setPlaybackError(true);
+    const handlePlaying = () => {
+      markOnline();
+    };
+
+    const handleWaiting = () => {
+      // Buffering singkat belum tentu berarti kamera offline.
+      stalledChecks = 0;
+      lastCurrentTime = video.currentTime;
+    };
+
+    const handleNativeError = () => {
+      markOffline("Browser gagal memuat stream CCTV");
+    };
+
+    video.addEventListener("playing", handlePlaying);
+    video.addEventListener("waiting", handleWaiting);
+    video.addEventListener("error", handleNativeError);
+
+    // Periksa apakah video yang sedang diputar masih bergerak.
+    healthCheckId = window.setInterval(() => {
+      if (disposed || video.paused || video.ended) return;
+
+      if (video.currentTime > lastCurrentTime + 0.1) {
+        lastCurrentTime = video.currentTime;
+        stalledChecks = 0;
+
+        if (
+          video.readyState >=
+          HTMLMediaElement.HAVE_CURRENT_DATA
+        ) {
+          markOnline();
+        }
+      } else {
+        stalledChecks += 1;
+
+        // Tiga pemeriksaan berturut-turut tanpa perkembangan video.
+        if (stalledChecks >= 3) {
+          markOffline(
+            "Video tidak menerima perkembangan data"
+          );
+        }
+      }
+    }, 5000);
 
     if (Hls.isSupported()) {
       hls = new Hls({
         enableWorker: true,
         lowLatencyMode: true,
         backBufferLength: 30,
+        manifestLoadingTimeOut: 10000,
+        manifestLoadingMaxRetry: 1,
+        levelLoadingTimeOut: 10000,
+        fragLoadingTimeOut: 15000,
       });
 
-      hls.loadSource(streamUrl);
-      hls.attachMedia(video);
-
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        setPlaybackError(false);
-
+        // Playlist berhasil dibaca belum berarti video aktif.
+        // Status Online baru ditetapkan setelah video berjalan.
         video.play().catch(() => {
-          // Browser dapat membatasi autoplay.
+          // Autoplay mungkin dibatasi oleh browser.
         });
       });
 
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (!data.fatal) return;
 
-        setPlaybackError(true);
-
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          hls.startLoad();
-        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-          hls.recoverMediaError();
-        } else {
-          hls.destroy();
+          markOffline(
+            "Stream tidak dapat diakses. Periksa URL atau server CCTV."
+          );
+
+          // Jangan terus mencoba URL playlist yang gagal ditemukan.
+          if (
+            data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR ||
+            data.details === Hls.ErrorDetails.MANIFEST_LOAD_TIMEOUT
+          ) {
+            hls.stopLoad();
+          }
+
+          return;
         }
+
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          markOffline("Terjadi gangguan pada media stream");
+          hls.recoverMediaError();
+          return;
+        }
+
+        markOffline("Stream gagal dimuat");
+        hls.destroy();
+        hls = null;
       });
+
+      hls.loadSource(streamUrl);
+      hls.attachMedia(video);
     } else if (
       video.canPlayType("application/vnd.apple.mpegurl")
     ) {
+      // Dukungan HLS bawaan browser, misalnya Safari.
       video.src = streamUrl;
-      video.addEventListener("error", handleNativeError);
 
       video.play().catch(() => {
-        // Pengguna bisa menekan tombol play.
+        // Pengguna dapat menekan tombol Play secara manual.
       });
     } else {
-      setPlaybackError(true);
+      markOffline("Browser tidak mendukung pemutaran HLS");
     }
 
     return () => {
-      if (hls) hls.destroy();
+      disposed = true;
 
+      if (healthCheckId !== null) {
+        window.clearInterval(healthCheckId);
+      }
+
+      video.removeEventListener("playing", handlePlaying);
+      video.removeEventListener("waiting", handleWaiting);
       video.removeEventListener("error", handleNativeError);
+
+      if (hls) {
+        hls.destroy();
+      }
+
       video.pause();
       video.removeAttribute("src");
       video.load();
     };
-  }, [streamUrl, isYouTube]);
+  }, [camera?.id, streamUrl, isYouTube]);
 
   if (!camera) return null;
 
@@ -113,9 +235,11 @@ export default function CameraPlayer({
 
   const handleShare = async () => {
     try {
-      await navigator.clipboard.writeText(window.location.href);
-      setCopied(true);
+      await navigator.clipboard.writeText(
+        window.location.href
+      );
 
+      setCopied(true);
       window.setTimeout(() => setCopied(false), 2000);
     } catch (error) {
       console.error("Gagal menyalin tautan:", error);
@@ -131,6 +255,24 @@ export default function CameraPlayer({
     camera.streamProvider === "dynamic-token"
       ? "Sumber ini menggunakan token dinamis untuk playlist dan segmen video. Tautan dari DevTools mungkin kedaluwarsa. Buka halaman sumber untuk mencoba melihat siaran."
       : "URL stream langsung untuk kamera ini belum ditambahkan. Jika URL HLS resmi tersedia, video dapat diputar langsung di BogorCam.";
+
+  const statusLabel =
+    playbackStatus === "online"
+      ? "Stream tersedia"
+      : playbackStatus === "offline"
+        ? "Offline"
+        : playbackStatus === "checking"
+          ? "Memeriksa stream"
+          : "Belum diverifikasi";
+
+  const statusDescription =
+    playbackStatus === "online"
+      ? "Status sumber online"
+      : playbackStatus === "offline"
+        ? "Status sumber offline"
+        : playbackStatus === "checking"
+          ? "Sedang memeriksa sumber"
+          : "Status belum diverifikasi";
 
   return (
     <section
@@ -240,9 +382,7 @@ export default function CameraPlayer({
 
           <span className="latency-pill">
             <Radio size={12} />
-            {camera.status === "online"
-              ? "Stream tersedia"
-              : "Belum diverifikasi"}
+            {statusLabel}
             <ChevronIcon />
           </span>
         </div>
@@ -251,14 +391,25 @@ export default function CameraPlayer({
           <div className="agency-mark">B</div>
 
           <div>
-            <small>{camera.updated}</small>
+            <small>
+              {playbackStatus === "offline"
+                ? "Stream gagal diakses"
+                : playbackStatus === "checking"
+                  ? "Sedang memeriksa stream"
+                  : playbackStatus === "online"
+                    ? "Stream berhasil diputar"
+                    : camera.updated}
+            </small>
+
             <strong>{camera.source}</strong>
           </div>
 
           <div className="detail-actions">
             <button
               className={liked ? "liked" : ""}
-              onClick={() => setLiked((value) => !value)}
+              onClick={() =>
+                setLiked((value) => !value)
+              }
               aria-label="Sukai"
               aria-pressed={liked}
               type="button"
@@ -268,7 +419,9 @@ export default function CameraPlayer({
 
             <button
               className={saved ? "saved" : ""}
-              onClick={() => setSaved((value) => !value)}
+              onClick={() =>
+                setSaved((value) => !value)
+              }
               aria-label="Simpan"
               aria-pressed={saved}
               type="button"
@@ -290,11 +443,7 @@ export default function CameraPlayer({
         <div className="view-count">
           <span>{camera.views ?? 0}x ditonton</span>
           <i>•</i>
-          <span>
-            {camera.status === "online"
-              ? "Status sumber online"
-              : "Status belum diverifikasi"}
-          </span>
+          <span>{statusDescription}</span>
         </div>
 
         <h3>Kamera lainnya di sekitar</h3>
@@ -314,7 +463,11 @@ export default function CameraPlayer({
                   <Video size={21} />
 
                   <span>
-                    {item.status === "online" ? "LIVE" : "NO SIGNAL"}
+                    {item.status === "online"
+                      ? "LIVE"
+                      : item.status === "offline"
+                        ? "OFFLINE"
+                        : "NO SIGNAL"}
                   </span>
                 </div>
 
